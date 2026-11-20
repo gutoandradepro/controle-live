@@ -210,15 +210,20 @@ h2{flex:none;font-size:clamp(17px,2.2vw,24px);margin-bottom:8px}
 </div>
 <div class="toast" id="toast"></div>
 
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js" onerror="var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js';s.onload=function(){window.__mqttLate&&window.__mqttLate()};document.head.appendChild(s)"></script>
 <script>
 {
-const RELAY = (new URLSearchParams(location.search).get("relay") || "https://ntfy.sh").replace(/\/$/, "");
+const QS = new URLSearchParams(location.search);
+const BROKERS = QS.get("broker") ? [QS.get("broker")] : ["wss://broker.emqx.io:8084/mqtt", "wss://broker.hivemq.com:8884/mqtt"];
+const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const clients = [], seenMsg = new Set();
+const online = () => clients.some(c => c.connected);
 const NAMES = { rankings: "Rankings", boasvindas: "Boas-vindas", oferta: "Oferta", creditos: "Créditos", voltoja: "Volto já", obs: "OBS" };
 const $ = id => document.getElementById(id);
 const store = { get: k => { try { return localStorage.getItem(k); } catch (e) { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} } };
 let canal = (location.hash || "").replace(/^#/, "").trim() || store.get("canal-live") || "";
 if (location.hash) store.set("canal-live", canal);
-const seen = {}; let ws = null, cenaAtual = "", musica = true;
+const seen = {}; let cenaAtual = "", musica = true, started = false;
 
 // status dos overlays
 $("chips").innerHTML = Object.entries(NAMES).map(([k, n]) => `<span class="chip" id="ch-${k}"><i></i>${n}</span>`).join("");
@@ -229,8 +234,10 @@ function buzz(ms = 15) { try { navigator.vibrate && navigator.vibrate(ms); } cat
 
 async function send(alvo, cmd, arg) {
   if (!canal) return false;
-  try { await fetch(`${RELAY}/${canal}`, { method: "POST", body: JSON.stringify({ de: "controle", alvo, cmd, arg }) }); return true; }
-  catch (e) { toast("SEM INTERNET?"); return false; }
+  if (!online()) { toast("SEM CONEXÃO · TENTANDO DE NOVO"); return false; }
+  const msg = JSON.stringify({ id: uid(), de: "controle", alvo, cmd, arg });
+  clients.forEach(c => { try { if (c.connected) c.publish("extremorec/" + canal, msg); } catch (e) {} });
+  return true;
 }
 function ping() {
   Object.keys(NAMES).forEach(k => { if (!seen[k] || Date.now() - seen[k] > 90000) chip(k, "wait"); });
@@ -258,19 +265,26 @@ function onInfo(nome, info) {
   if (nome === "voltoja" && "restante" in info) { const s = info.restante; $("vjInfo").textContent = s ? "FALTAM " + String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0") : ""; }
 }
 
+function onMessage(raw) {
+  let c; try { c = JSON.parse(raw); } catch (_) { return; }
+  if (!c || !c.id || seenMsg.has(c.id)) return; seenMsg.add(c.id); if (seenMsg.size > 800) seenMsg.clear();
+  if (c.de !== "overlay" || !NAMES[c.nome]) return;
+  seen[c.nome] = Date.now(); chip(c.nome, "ok");
+  if (c.tipo === "cena" && c.info) markScene(c.info.atual);
+  onInfo(c.nome, c.info);
+}
+function setConn() {
+  const on = online(); $("conn").classList.toggle("on", on); $("connTxt").textContent = on ? "NO AR" : "CONECTANDO";
+}
 function connect() {
-  if (!canal) return;
-  try { ws = new WebSocket(RELAY.replace(/^http/, "ws") + "/" + canal + "/ws"); } catch (e) { setTimeout(connect, 4000); return; }
-  ws.onopen = () => { $("conn").classList.add("on"); $("connTxt").textContent = "NO AR"; ping(); };
-  ws.onclose = () => { $("conn").classList.remove("on"); $("connTxt").textContent = "RECONECTANDO"; setTimeout(connect, 3000); };
-  ws.onerror = () => { try { ws.close(); } catch (e) {} };
-  ws.onmessage = e => {
-    let m, c; try { m = JSON.parse(e.data); if (m.event !== "message") return; c = JSON.parse(m.message); } catch (_) { return; }
-    if (!c || c.de !== "overlay" || !NAMES[c.nome]) return;
-    seen[c.nome] = Date.now(); chip(c.nome, "ok");
-    if (c.tipo === "cena" && c.info) markScene(c.info.atual);
-    onInfo(c.nome, c.info);
-  };
+  if (!canal || started || !window.mqtt) return; started = true;
+  BROKERS.forEach(url => {
+    const c = window.mqtt.connect(url, { clientId: "exr-controle-" + uid(), reconnectPeriod: 3000, connectTimeout: 10000, clean: true, keepalive: 30 });
+    c.on("connect", () => { c.subscribe("extremorec/" + canal); setConn(); setTimeout(ping, 500); });
+    c.on("close", setConn); c.on("offline", setConn); c.on("error", () => {});
+    c.on("message", (t, p) => onMessage(p.toString()));
+    clients.push(c);
+  });
 }
 
 // botões
@@ -302,11 +316,12 @@ $("trocaBtn").addEventListener("click", () => { $("canalIn").value = canal; $("s
 $("salvar").addEventListener("click", () => {
   const v = $("canalIn").value.trim().replace(/^#/, ""); if (!v) return;
   canal = v; store.set("canal-live", v); $("setup").classList.remove("on"); $("canalTxt").textContent = "···" + canal.slice(-4);
-  try { ws && ws.close(); } catch (e) {} if (!ws) connect();
+  clients.forEach(c => { try { c.end(true); } catch (e) {} }); clients.length = 0; started = false; connect();
 });
-document.addEventListener("visibilitychange", () => { if (!document.hidden && ws && ws.readyState === 1) ping(); });
-setInterval(() => { if (!document.hidden && ws && ws.readyState === 1) ping(); }, 60000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden && online()) ping(); });
+setInterval(() => { if (!document.hidden && online()) ping(); }, 60000);
 
+window.__mqttLate = connect;
 if (!canal) $("setup").classList.add("on"); else { $("canalTxt").textContent = "···" + canal.slice(-4); connect(); }
 }
 </script>
